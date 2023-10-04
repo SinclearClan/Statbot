@@ -428,11 +428,16 @@ func saveVoiceEvent(guildID, userID, channelID string) {
 	var voiceEventType string
 	if channelID != "" {
 		// Prüfe, ob bereits ein Eintrag in der Tabelle für die aktuellen Aufenthalte vorhanden ist
-		rows, err := db.Query(`
+		stmt, err := db.Prepare(`
 			SELECT id
 			FROM voice_current
 			WHERE user_id = ?
-		`, userID)
+		`)
+		if err != nil {
+			log.Fatal("Problem beim Abrufen des aktuellen Aufenthalts: ", err)
+		}
+		defer stmt.Close()
+		rows, err := stmt.Query(userID)
 		if err != nil {
 			log.Fatal("Problem beim Abrufen des aktuellen Aufenthalts: ", err)
 		}
@@ -442,11 +447,17 @@ func saveVoiceEvent(guildID, userID, channelID string) {
 		if rows.Next() {
 			// Hole die ChannelID aus der Tabelle für die aktuellen Aufenthalte
 			var currentChannelID string
-			err = db.QueryRow(`
+
+			stmt, err := db.Prepare(`
 				SELECT channel_id
 				FROM voice_current
 				WHERE user_id = ?
-			`, userID).Scan(&currentChannelID)
+			`)
+			if err != nil {
+				log.Fatal("Problem beim Abrufen der Channel-ID des aktuellen Aufenthalts: ", err)
+			}
+			defer stmt.Close()
+			err = stmt.QueryRow(userID).Scan(&currentChannelID)
 			if err != nil {
 				log.Fatal("Problem beim Abrufen der Channel-ID des aktuellen Aufenthalts: ", err)
 			}
@@ -467,70 +478,132 @@ func saveVoiceEvent(guildID, userID, channelID string) {
 		voiceEventType = "leave"
 	}
 
-	// Füge die Nachricht der Tabelle für
 	// Wenn es ein join-Event ist, dann füge es der Tabelle für die aktuellen Aufenthalte hinzu
 	// Wenn es ein move-Event ist, dann behandle es wie ein leave-Event, und füge es dann wie ein join-Event hinzu
 	// Wenn es ein leave-Event ist, dann berechne die Zeit, die der Nutzer im Voice-Channel verbracht hat
 	if voiceEventType == "join" {
 		// Füge den Eintrag in die Tabelle für die aktuellen Aufenthalte hinzu
-		_, err = db.Exec(`
+		stmt, err := db.Prepare(`
 			INSERT INTO voice_current (channel_id, user_id, start)
 			VALUES (?, ?, ?)
-		`, channelID, userID, now.Format(time.RFC3339))
+		`)
+		if err != nil {
+			log.Fatal("Problem beim Speichern des Voice-Events [0]: ", err)
+		}
+		defer stmt.Close()
+		_, err = stmt.Exec(channelID, userID, now.Format(time.RFC3339))
 		if err != nil {
 			log.Fatal("Problem beim Speichern des Voice-Events [1]: ", err)
 		}
 	} else if voiceEventType == "leave" || voiceEventType == "move" {
-		// Rufe den Zeitpunkt des letzten join-Events für diesen Nutzer ab
 		var start time.Time
-		err = db.QueryRow(`
+		var channelID string
+		// Rufe den Zeitpunkt des letzten join-Events für diesen Nutzer ab
+		stmt, err := db.Prepare(`
 			SELECT start
 			FROM voice_current
 			WHERE user_id = ?
-		`, userID).Scan(&start)
+		`)
 		if err != nil {
 			log.Fatal("Problem beim Abrufen der Startzeit aktuellen Aufenthalts: ", err)
+		}
+		defer stmt.Close()
+		rows, err := stmt.Query(userID)
+		if err != nil {
+			log.Fatal("Problem beim Abrufen der Startzeit aktuellen Aufenthalts: ", err)
+		}
+
+		for rows.Next() {
+			var start time.Time
+			stmt, err := db.Prepare(`
+				SELECT start
+				FROM voice_current
+				WHERE user_id = ?
+			`)
+			if err != nil {
+				log.Fatal("Problem beim Abrufen der Startzeit aktuellen Aufenthalts: ", err)
+			}
+			defer stmt.Close()
+			err = stmt.QueryRow(userID).Scan(&start)
+			if err != nil {
+				log.Fatal("Problem beim Abrufen der Startzeit aktuellen Aufenthalts: ", err)
+			}
+
+			// Rufe die Channel-ID des aktuellen Aufenthalts ab
+			stmt, err = db.Prepare(`
+				SELECT channel_id
+				FROM voice_current
+				WHERE user_id = ?
+			`)
+			if err != nil {
+				log.Fatal("Problem beim Abrufen der Channel-ID des aktuellen Aufenthalts: ", err)
+			}
+			defer stmt.Close()
+			err = stmt.QueryRow(userID).Scan(&channelID)
+			if err != nil {
+				log.Fatal("Problem beim Abrufen der Channel-ID des aktuellen Aufenthalts: ", err)
+			}
+
+			// Lösche diesen Eintrag aus der Tabelle für die aktuellen Aufenthalte
+			stmt, err = db.Prepare(`
+				DELETE FROM voice_current
+				WHERE user_id = ?
+			`)
+			if err != nil {
+				log.Fatal("Problem beim Löschen des aktuellen Aufenthalts: ", err)
+			}
+			defer stmt.Close()
+			_, err = stmt.Exec(userID)
+			if err != nil {
+				log.Fatal("Problem beim Löschen des aktuellen Aufenthalts: ", err)
+			}
 		}
 
 		// Berechne die Zeit, die der Nutzer im Voice-Channel verbracht hat
 		duration := int(now.Sub(start).Minutes())
 
-		// Da bei einem leave-Event die Channel-ID leer ist, muss diese aus der Tabelle für die aktuellen Aufenthalte abgerufen werden
-		err = db.QueryRow(`
-			SELECT channel_id
-			FROM voice_current
-			WHERE user_id = ?
-		`, userID).Scan(&channelID)
-		if err != nil {
-			log.Fatal("Problem beim Abrufen der Channel-ID des aktuellen Aufenthalts: ", err)
-		}
-
 		// Trage die Zeit in die Tabelle voice ein
-		_, err = db.Exec(`
+		stmt, err = db.Prepare(`
 			INSERT INTO voice (user_id, channel_id, duration)
 			VALUES (?, ?, ?)
-		`, userID, channelID, duration)
+		`)
 		if err != nil {
 			log.Fatal("Problem beim Speichern des Voice-Events [2]: ", err)
 		}
+		defer stmt.Close()
+		_, err = stmt.Exec(userID, channelID, duration)
+		if err != nil {
+			log.Fatal("Problem beim Speichern des Voice-Events [3]: ", err)
+		}
 
 		// Lösche den Eintrag aus der Tabelle für die aktuellen Aufenthalte
-		_, err = db.Exec(`
+		stmt, err = db.Prepare(`
 			DELETE FROM voice_current
 			WHERE user_id = ?
-		`, userID)
+		`)
+		if err != nil {
+			log.Fatal("Problem beim Löschen des aktuellen Aufenthalts: ", err)
+		}
+		defer stmt.Close()
+		_, err = stmt.Exec(userID)
 		if err != nil {
 			log.Fatal("Problem beim Löschen des aktuellen Aufenthalts: ", err)
 		}
 
+		// Wenn es ein move-Event ist, dann füge den Eintrag in die Tabelle für die aktuellen Aufenthalte hinzu
 		if voiceEventType == "move" {
 			// Füge den Eintrag in die Tabelle für die aktuellen Aufenthalte hinzu
-			_, err = db.Exec(`
+			stmt, err := db.Prepare(`
 				INSERT INTO voice_current (channel_id, user_id, start)
 				VALUES (?, ?, ?)
-			`, channelID, userID, now.Format(time.RFC3339))
+			`)
 			if err != nil {
-				log.Fatal("Problem beim Speichern des Voice-Events [3]: ", err)
+				log.Fatal("Problem beim Speichern des Voice-Events [0]: ", err)
+			}
+			defer stmt.Close()
+			_, err = stmt.Exec(channelID, userID, now.Format(time.RFC3339))
+			if err != nil {
+				log.Fatal("Problem beim Speichern des Voice-Events [1]: ", err)
 			}
 		}
 	} else {
