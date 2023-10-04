@@ -304,12 +304,7 @@ func messageHandler(dg *discordgo.Session, m *discordgo.MessageCreate) {
 }
 
 func voiceStateUpdateHandler(dg *discordgo.Session, m *discordgo.VoiceStateUpdate) {
-	// Speichere das Voice-Event in der Datenbank
-	if m.ChannelID != "" {
-		saveVoiceEvent("join", m.GuildID, m.UserID, m.ChannelID)
-	} else {
-		saveVoiceEvent("leave", m.GuildID, m.UserID, m.ChannelID)
-	}
+	saveVoiceEvent(m.GuildID, m.UserID, m.ChannelID)
 }
 
 func setupDatabase(guildID string) error {
@@ -374,6 +369,14 @@ func setupDatabase(guildID string) error {
 		return fmt.Errorf("problem beim Erstellen der Tabelle für die aktuellen Aufenthalte im Voice-Channel: %s", err)
 	}
 
+	// Prüfe, ob in der voice_current-Tabelle noch Einträge vorhanden sind und lösche diese
+	_, err = db.Exec(`
+		DELETE FROM voice_current
+	`)
+	if err != nil {
+		return fmt.Errorf("problem beim Löschen der Einträge aus der Tabelle für die aktuellen Aufenthalte im Voice-Channel: %s", err)
+	}
+
 	return nil
 }
 
@@ -401,7 +404,7 @@ func saveMessage(guildID, userID, channelID string) {
 	}
 }
 
-func saveVoiceEvent(voiceEventType, guildID, userID, channelID string) {
+func saveVoiceEvent(guildID, userID, channelID string) {
 	// Aktuelles Datum und Zeit
 	now := time.Now()
 
@@ -415,11 +418,16 @@ func saveVoiceEvent(voiceEventType, guildID, userID, channelID string) {
 	}
 	defer db.Close()
 
-	// Füge die Nachricht der Tabelle für
-	// Wenn es ein join-Event ist, dann füge es der Tabelle für die aktuellen Aufenthalte hinzu
-	// Wenn es ein leave-Event ist, dann berechne die Zeit, die der Nutzer im Voice-Channel verbracht hat
-	if voiceEventType == "join" {
-		// Prüfe erst, ob bereits ein join-Event für diesen Nutzer in der Tabelle ist
+	// Finde den Typ des Voice-Events heraus.
+	// Wenn eine ChannelID angegeben ist, dann befindet sich der Nutzer in einem Voice-Channel.
+	// Wenn sich noch kein Eintrag in der Tabelle für die aktuellen Aufenthalte befindet, dann ist es ein join-Event.
+	// Wenn bereits ein Eintrag in der Tabelle für die aktuellen Aufenthalte vorhanden ist, dann muss überprüft werden, ob sich die ChannelID geändert hat.
+	// Wenn sich die ChannelID geändert hat, dann ist es ein move-Event.
+	// Wenn sich die ChannelID nicht geändert hat, dann muss das Event ignoriert werden.
+	// Wenn keine ChannelID angegeben ist, dann befindet sich der Nutzer nicht mehr in einem Voice-Channel, dann ist es ein leave-Event.
+	var voiceEventType string
+	if channelID != "" {
+		// Prüfe, ob bereits ein Eintrag in der Tabelle für die aktuellen Aufenthalte vorhanden ist
 		rows, err := db.Query(`
 			SELECT id
 			FROM voice_current
@@ -430,53 +438,49 @@ func saveVoiceEvent(voiceEventType, guildID, userID, channelID string) {
 		}
 		defer rows.Close()
 
-		// Wenn es bereits einen Eintrag für diesen Nutzer gibt, dann berechne die Zeit, die er im Voice-Channel verbracht hat und trage diese in die Tabelle voice ein
+		// Wenn bereits ein Eintrag vorhanden ist, dann prüfe, ob sich die ChannelID geändert hat
 		if rows.Next() {
-			// Hole die ID des Eintrags
-			var id int
-			rows.Scan(&id)
-
-			// Hole die Zeit, zu der der Nutzer den Voice-Channel betreten hat
-			var start time.Time
+			// Hole die ChannelID aus der Tabelle für die aktuellen Aufenthalte
+			var currentChannelID string
 			err = db.QueryRow(`
-				SELECT start
+				SELECT channel_id
 				FROM voice_current
-				WHERE id = ?
-			`, id).Scan(&start)
+				WHERE user_id = ?
+			`, userID).Scan(&currentChannelID)
 			if err != nil {
-				log.Fatal("Problem beim Abrufen der Startzeit aktuellen Aufenthalts: ", err)
+				log.Fatal("Problem beim Abrufen der Channel-ID des aktuellen Aufenthalts: ", err)
 			}
 
-			// Berechne die Zeit, die der Nutzer im Voice-Channel verbracht hat
-			duration := now.Sub(start)
-
-			// Trage die Zeit in die Tabelle voice ein
-			_, err = db.Exec(`
-				INSERT INTO voice (user_id, channel_id, duration)
-				VALUES (?, ?, ?)
-			`, userID, channelID, duration.Minutes())
-			if err != nil {
-				log.Fatal("Problem beim Speichern des Voice-Events [1]: ", err)
+			// Wenn sich die ChannelID geändert hat, dann ist es ein move-Event
+			if currentChannelID != channelID {
+				voiceEventType = "move"
+			} else {
+				// Wenn sich die ChannelID nicht geändert hat, dann ignoriere das Event
+				return
 			}
-
-			// Lösche den Eintrag aus der Tabelle für die aktuellen Aufenthalte
-			_, err = db.Exec(`
-				DELETE FROM voice_current
-				WHERE id = ?
-			`, id)
-			if err != nil {
-				log.Fatal("Problem beim Löschen des aktuellen Aufenthalts: ", err)
-			}
+		} else {
+			// Wenn noch kein Eintrag vorhanden ist, dann ist es ein join-Event
+			voiceEventType = "join"
 		}
+	} else {
+		// Wenn keine ChannelID angegeben ist, dann ist es ein leave-Event
+		voiceEventType = "leave"
+	}
 
+	// Füge die Nachricht der Tabelle für
+	// Wenn es ein join-Event ist, dann füge es der Tabelle für die aktuellen Aufenthalte hinzu
+	// Wenn es ein move-Event ist, dann behandle es wie ein leave-Event, und füge es dann wie ein join-Event hinzu
+	// Wenn es ein leave-Event ist, dann berechne die Zeit, die der Nutzer im Voice-Channel verbracht hat
+	if voiceEventType == "join" {
+		// Füge den Eintrag in die Tabelle für die aktuellen Aufenthalte hinzu
 		_, err = db.Exec(`
 			INSERT INTO voice_current (channel_id, user_id, start)
 			VALUES (?, ?, ?)
 		`, channelID, userID, now.Format(time.RFC3339))
 		if err != nil {
-			log.Fatal("Problem beim Speichern des aktuellen Aufenthalts: ", err)
+			log.Fatal("Problem beim Speichern des Voice-Events [1]: ", err)
 		}
-	} else if voiceEventType == "leave" {
+	} else if voiceEventType == "leave" || voiceEventType == "move" {
 		// Rufe den Zeitpunkt des letzten join-Events für diesen Nutzer ab
 		var start time.Time
 		err = db.QueryRow(`
@@ -489,7 +493,7 @@ func saveVoiceEvent(voiceEventType, guildID, userID, channelID string) {
 		}
 
 		// Berechne die Zeit, die der Nutzer im Voice-Channel verbracht hat
-		duration := now.Sub(start)
+		duration := int(now.Sub(start).Minutes())
 
 		// Da bei einem leave-Event die Channel-ID leer ist, muss diese aus der Tabelle für die aktuellen Aufenthalte abgerufen werden
 		err = db.QueryRow(`
@@ -505,7 +509,7 @@ func saveVoiceEvent(voiceEventType, guildID, userID, channelID string) {
 		_, err = db.Exec(`
 			INSERT INTO voice (user_id, channel_id, duration)
 			VALUES (?, ?, ?)
-		`, userID, channelID, duration.Minutes())
+		`, userID, channelID, duration)
 		if err != nil {
 			log.Fatal("Problem beim Speichern des Voice-Events [2]: ", err)
 		}
@@ -519,6 +523,16 @@ func saveVoiceEvent(voiceEventType, guildID, userID, channelID string) {
 			log.Fatal("Problem beim Löschen des aktuellen Aufenthalts: ", err)
 		}
 
+		if voiceEventType == "move" {
+			// Füge den Eintrag in die Tabelle für die aktuellen Aufenthalte hinzu
+			_, err = db.Exec(`
+				INSERT INTO voice_current (channel_id, user_id, start)
+				VALUES (?, ?, ?)
+			`, channelID, userID, now.Format(time.RFC3339))
+			if err != nil {
+				log.Fatal("Problem beim Speichern des Voice-Events [3]: ", err)
+			}
+		}
 	} else {
 		log.Fatal("Ungültiger Voice-Event-Typ")
 	}
