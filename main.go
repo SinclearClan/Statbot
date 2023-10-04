@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/signal"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
@@ -17,8 +16,7 @@ import (
 )
 
 var (
-	dgp    *discordgo.Session
-	dbLock sync.Mutex
+	dgp *discordgo.Session
 )
 
 func main() {
@@ -78,6 +76,21 @@ func main() {
 	if err != nil {
 		log.Println("Fehler beim Öffnen der Discord-Sitzung:", err)
 		return
+	}
+
+	// Rufe die Liste der Guilds ab, auf denen der Bot Mitglied ist
+	guilds, err := dg.UserGuilds(100, "", "")
+	if err != nil {
+		log.Fatal("Fehler beim Abrufen der Guilds:", err)
+		return
+	}
+
+	// Setup der Datenbank für jede Guild
+	for _, guild := range guilds {
+		err := setupDatabase(guild.ID)
+		if err != nil {
+			log.Fatalf("Fehler beim Einrichten der Datenbank für Guild %s: %s", guild.Name, err)
+		}
 	}
 
 	// Füge die Slash-Commands hinzu
@@ -299,7 +312,7 @@ func voiceStateUpdateHandler(dg *discordgo.Session, m *discordgo.VoiceStateUpdat
 	}
 }
 
-func checkDatabaseSetup(guildID string) bool {
+func setupDatabase(guildID string) error {
 	// Name der Datenbankdatei nach dem Schema "GuildID-Month.db"
 	dbName := fmt.Sprintf("%s-%d.db", guildID, time.Now().Month())
 
@@ -310,8 +323,7 @@ func checkDatabaseSetup(guildID string) bool {
 		// Erstelle die Datenbankdatei
 		file, err := os.Create(dbName)
 		if err != nil {
-			log.Fatal("Problem beim Erstellen der Datenbankdatei: ", err)
-			return false
+			return fmt.Errorf("problem beim Erstellen der Datenbankdatei: %s", err)
 		}
 		file.Close()
 	}
@@ -319,8 +331,7 @@ func checkDatabaseSetup(guildID string) bool {
 	// Öffne die Datenbankverbindung
 	db, err := sql.Open("sqlite3", dbName)
 	if err != nil {
-		log.Fatal("Problem beim Öffnen der Datenbank: ", err)
-		return false
+		return fmt.Errorf("problem beim Öffnen der Datenbank: %s", err)
 	}
 	defer db.Close()
 
@@ -334,8 +345,7 @@ func checkDatabaseSetup(guildID string) bool {
 		)
 	`)
 	if err != nil {
-		log.Fatal("Problem beim Erstellen der Tabelle für die Nachrichten: ", err)
-		return false
+		return fmt.Errorf("problem beim Erstellen der Tabelle für die Nachrichten: %s", err)
 	}
 
 	// Tabelle für die Voice-Events
@@ -348,8 +358,7 @@ func checkDatabaseSetup(guildID string) bool {
 		)
 	`)
 	if err != nil {
-		log.Fatal("Problem beim Erstellen der Tabelle für die Voice-Events: ", err)
-		return false
+		return fmt.Errorf("problem beim Erstellen der Tabelle für die Voice-Events: %s", err)
 	}
 
 	// Tabelle für aktuelle Aufenthalte im Voice-Channel
@@ -362,21 +371,13 @@ func checkDatabaseSetup(guildID string) bool {
 		)
 	`)
 	if err != nil {
-		log.Fatal("Problem beim Erstellen der Tabelle für die aktuellen Aufenthalte im Voice-Channel: ", err)
-		return false
+		return fmt.Errorf("problem beim Erstellen der Tabelle für die aktuellen Aufenthalte im Voice-Channel: %s", err)
 	}
 
-	return true
+	return nil
 }
 
 func saveMessage(guildID, userID, channelID string) {
-	dbLock.Lock()
-	defer dbLock.Unlock()
-
-	if !checkDatabaseSetup(guildID) {
-		log.Fatal("Datenbank nicht eingerichtet")
-	}
-
 	// Aktuelles Datum und Zeit
 	now := time.Now()
 
@@ -401,13 +402,6 @@ func saveMessage(guildID, userID, channelID string) {
 }
 
 func saveVoiceEvent(voiceEventType, guildID, userID, channelID string) {
-	dbLock.Lock()
-	defer dbLock.Unlock()
-
-	if !checkDatabaseSetup(guildID) {
-		log.Fatal("Datenbank nicht eingerichtet")
-	}
-
 	// Aktuelles Datum und Zeit
 	now := time.Now()
 
@@ -462,7 +456,7 @@ func saveVoiceEvent(voiceEventType, guildID, userID, channelID string) {
 				VALUES (?, ?, ?)
 			`, userID, channelID, duration.Minutes())
 			if err != nil {
-				log.Fatal("Problem beim Speichern des Voice-Events: ", err)
+				log.Fatal("Problem beim Speichern des Voice-Events [1]: ", err)
 			}
 
 			// Lösche den Eintrag aus der Tabelle für die aktuellen Aufenthalte
@@ -513,7 +507,7 @@ func saveVoiceEvent(voiceEventType, guildID, userID, channelID string) {
 			VALUES (?, ?, ?)
 		`, userID, channelID, duration.Minutes())
 		if err != nil {
-			log.Fatal("Problem beim Speichern des Voice-Events: ", err)
+			log.Fatal("Problem beim Speichern des Voice-Events [2]: ", err)
 		}
 
 		// Lösche den Eintrag aus der Tabelle für die aktuellen Aufenthalte
