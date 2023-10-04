@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
@@ -16,7 +17,8 @@ import (
 )
 
 var (
-	dgp *discordgo.Session
+	dgp    *discordgo.Session
+	dbLock sync.Mutex
 )
 
 func main() {
@@ -104,6 +106,7 @@ func main() {
 		// Beispiel:
 		channelData := getChannelData(guildID)
 		userData := getUserData(guildID)
+		voiceData := getVoiceData(guildID)
 
 		// Erstelle die HTML-Seite mit den Diagrammen
 		html := `
@@ -121,14 +124,19 @@ func main() {
 			<div style="width:400px;height:400px;">
 				<canvas id="userChart" width="400" height="400"></canvas>
 			</div>
+			<div style="width:400px;height:400px;">
+    			<canvas id="voiceChart" width="400" height="400"></canvas>
+			</div>
 			<script>
 				// Code zum Erstellen der Diagramme mit Chart.js
 				var channelData = JSON.parse('%s'); // JSON mit den Channel-Daten
 				var userData = JSON.parse('%s'); // JSON mit den User-Daten
+				var voiceData = JSON.parse('%s'); // JSON mit den Voice-Daten
 
 				// Hier Chart.js verwenden, um die Diagramme zu erstellen
 				var ctxChannel = document.getElementById('channelChart').getContext('2d');
 				var ctxUser = document.getElementById('userChart').getContext('2d');
+				var ctxVoice = document.getElementById('voiceChart').getContext('2d');
 
 				var channelLabels = channelData.map(function(item) {
 					return item.name;
@@ -143,6 +151,13 @@ func main() {
 				});
 				var userDataValues = userData.map(function(item) {
 					return item.count;
+				});
+
+				var voiceLabels = voiceData.map(function(item) {
+					return item.name;
+				});
+				var voiceDataValues = voiceData.map(function(item) {
+					return item.duration;
 				});
 
 				var channelChart = new Chart(ctxChannel, {
@@ -208,13 +223,45 @@ func main() {
 						}
 					}
 				});
+
+				var voiceChart = new Chart(ctxVoice, {
+					type: 'bar',
+					data: {
+						labels: voiceLabels,
+						datasets: [{
+							label: 'Zeit im Voice-Chat (in Minuten)',
+							data: voiceDataValues,
+							backgroundColor: 'rgba(255, 159, 64, 0.2)',
+							borderColor: 'rgba(255, 159, 64, 1)',
+							borderWidth: 1
+						}]
+					},
+					options: {
+						scales: {
+							x: {
+								beginAtZero: true,
+								title: {
+									display: true,
+									text: 'Nutzer'
+								}
+							},
+							y: {
+								beginAtZero: true,
+								title: {
+									display: true,
+									text: 'Zeit (in Minuten)'
+								}
+							}
+						}
+					}
+				});
 			</script>
 		</body>
 		</html>
 		`
 
 		// Sende die HTML-Seite zurück
-		fmt.Fprintf(w, html, channelData, userData)
+		fmt.Fprintf(w, html, channelData, userData, voiceData)
 	})
 
 	// Starte den Webserver
@@ -246,55 +293,95 @@ func messageHandler(dg *discordgo.Session, m *discordgo.MessageCreate) {
 func voiceStateUpdateHandler(dg *discordgo.Session, m *discordgo.VoiceStateUpdate) {
 	// Speichere das Voice-Event in der Datenbank
 	if m.ChannelID != "" {
-		saveVoiceEvenet("join", m.GuildID, m.UserID, m.ChannelID)
+		saveVoiceEvent("join", m.GuildID, m.UserID, m.ChannelID)
 	} else {
-		saveVoiceEvenet("leave", m.GuildID, m.UserID, m.ChannelID)
+		saveVoiceEvent("leave", m.GuildID, m.UserID, m.ChannelID)
 	}
 }
 
+func checkDatabaseSetup(guildID string) bool {
+	// Name der Datenbankdatei nach dem Schema "GuildID-Month.db"
+	dbName := fmt.Sprintf("%s-%d.db", guildID, time.Now().Month())
+
+	// Überprüfen, ob die Datenbankdatei bereits existiert
+	if _, err := os.Stat(dbName); os.IsNotExist(err) {
+		log.Println("Datenbankdatei existiert nicht. Erstelle neue Datenbankdatei...")
+
+		// Erstelle die Datenbankdatei
+		file, err := os.Create(dbName)
+		if err != nil {
+			log.Fatal("Problem beim Erstellen der Datenbankdatei: ", err)
+			return false
+		}
+		file.Close()
+	}
+
+	// Öffne die Datenbankverbindung
+	db, err := sql.Open("sqlite3", dbName)
+	if err != nil {
+		log.Fatal("Problem beim Öffnen der Datenbank: ", err)
+		return false
+	}
+	defer db.Close()
+
+	// Tabelle für die Nachrichten
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS chat (
+			id INTEGER PRIMARY KEY,
+			channel_id TEXT,
+			user_id TEXT,
+			time DATETIME
+		)
+	`)
+	if err != nil {
+		log.Fatal("Problem beim Erstellen der Tabelle für die Nachrichten: ", err)
+		return false
+	}
+
+	// Tabelle für die Voice-Events
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS voice (
+			id INTEGER PRIMARY KEY,
+			user_id TEXT,
+			channel_id TEXT,
+			duration INTEGER
+		)
+	`)
+	if err != nil {
+		log.Fatal("Problem beim Erstellen der Tabelle für die Voice-Events: ", err)
+		return false
+	}
+
+	// Tabelle für aktuelle Aufenthalte im Voice-Channel
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS voice_current (
+			id INTEGER PRIMARY KEY,
+			channel_id TEXT,
+			user_id TEXT,
+			start DATETIME
+		)
+	`)
+	if err != nil {
+		log.Fatal("Problem beim Erstellen der Tabelle für die aktuellen Aufenthalte im Voice-Channel: ", err)
+		return false
+	}
+
+	return true
+}
+
 func saveMessage(guildID, userID, channelID string) {
+	dbLock.Lock()
+	defer dbLock.Unlock()
+
+	if !checkDatabaseSetup(guildID) {
+		log.Fatal("Datenbank nicht eingerichtet")
+	}
+
 	// Aktuelles Datum und Zeit
 	now := time.Now()
 
 	// Name der Datenbankdatei nach dem Schema "GuildID-Month.db"
 	dbName := fmt.Sprintf("%s-%d.db", guildID, now.Month())
-
-	// Überprüfen, ob die Datenbankdatei bereits existiert
-	if _, err := os.Stat(dbName); os.IsNotExist(err) {
-		// Wenn nicht, dann erstelle sie
-		db, err := sql.Open("sqlite3", dbName)
-		if err != nil {
-			log.Fatal("Problem beim Erstellen der Datenbank: ", err)
-		}
-		defer db.Close()
-
-		// Tabelle für die Nachrichten
-		_, err = db.Exec(`
-			CREATE TABLE IF NOT EXISTS chat (
-				id INTEGER PRIMARY KEY,
-				channel_id TEXT,
-				user_id TEXT,
-				time DATETIME
-			)
-		`)
-		if err != nil {
-			log.Fatal("Problem beim Erstellen der Tabelle für die Nachrichten: ", err)
-		}
-
-		// Tabelle für die Voice-Events
-		_, err = db.Exec(`
-			CREATE TABLE IF NOT EXISTS voice (
-				id INTEGER PRIMARY KEY,
-				type TEXT,
-				channel_id TEXT,
-				user_id TEXT,
-				time DATETIME
-			)
-		`)
-		if err != nil {
-			log.Fatal("Problem beim Erstellen der Tabelle für die Voice-Events: ", err)
-		}
-	}
 
 	// Öffne die Datenbankverbindung
 	db, err := sql.Open("sqlite3", dbName)
@@ -313,49 +400,19 @@ func saveMessage(guildID, userID, channelID string) {
 	}
 }
 
-func saveVoiceEvenet(voiceEventType, guildID, userID, channelID string) {
+func saveVoiceEvent(voiceEventType, guildID, userID, channelID string) {
+	dbLock.Lock()
+	defer dbLock.Unlock()
+
+	if !checkDatabaseSetup(guildID) {
+		log.Fatal("Datenbank nicht eingerichtet")
+	}
+
 	// Aktuelles Datum und Zeit
 	now := time.Now()
 
 	// Name der Datenbankdatei nach dem Schema "GuildID-Month.db"
 	dbName := fmt.Sprintf("%s-%d.db", guildID, now.Month())
-
-	// Überprüfen, ob die Datenbankdatei bereits existiert
-	if _, err := os.Stat(dbName); os.IsNotExist(err) {
-		// Wenn nicht, dann erstelle sie
-		db, err := sql.Open("sqlite3", dbName)
-		if err != nil {
-			log.Fatal("Problem beim Erstellen der Datenbank: ", err)
-		}
-		defer db.Close()
-
-		// Tabelle für die Voice-Events
-		_, err = db.Exec(`
-			CREATE TABLE IF NOT EXISTS voice (
-				id INTEGER PRIMARY KEY,
-				type TEXT,
-				channel_id TEXT,
-				user_id TEXT,
-				time DATETIME
-			)
-		`)
-		if err != nil {
-			log.Fatal("Problem beim Erstellen der Tabelle für die Voice-Events: ", err)
-		}
-
-		// Tabelle für die Nachrichten
-		_, err = db.Exec(`
-			CREATE TABLE IF NOT EXISTS chat (
-				id INTEGER PRIMARY KEY,
-				channel_id TEXT,
-				user_id TEXT,
-				time DATETIME
-			)
-		`)
-		if err != nil {
-			log.Fatal("Problem beim Erstellen der Tabelle für die Nachrichten: ", err)
-		}
-	}
 
 	// Öffne die Datenbankverbindung
 	db, err := sql.Open("sqlite3", dbName)
@@ -364,13 +421,112 @@ func saveVoiceEvenet(voiceEventType, guildID, userID, channelID string) {
 	}
 	defer db.Close()
 
-	// Füge die Nachricht der Tabelle hinzu
-	_, err = db.Exec(`
-		INSERT INTO voice (type, channel_id, user_id, time)
-		VALUES (?, ?, ?, ?)
-	`, voiceEventType, channelID, userID, now.Format(time.RFC3339))
-	if err != nil {
-		log.Fatal("Problem beim Speichern des Voice-Events: ", err)
+	// Füge die Nachricht der Tabelle für
+	// Wenn es ein join-Event ist, dann füge es der Tabelle für die aktuellen Aufenthalte hinzu
+	// Wenn es ein leave-Event ist, dann berechne die Zeit, die der Nutzer im Voice-Channel verbracht hat
+	if voiceEventType == "join" {
+		// Prüfe erst, ob bereits ein join-Event für diesen Nutzer in der Tabelle ist
+		rows, err := db.Query(`
+			SELECT id
+			FROM voice_current
+			WHERE user_id = ?
+		`, userID)
+		if err != nil {
+			log.Fatal("Problem beim Abrufen des aktuellen Aufenthalts: ", err)
+		}
+		defer rows.Close()
+
+		// Wenn es bereits einen Eintrag für diesen Nutzer gibt, dann berechne die Zeit, die er im Voice-Channel verbracht hat und trage diese in die Tabelle voice ein
+		if rows.Next() {
+			// Hole die ID des Eintrags
+			var id int
+			rows.Scan(&id)
+
+			// Hole die Zeit, zu der der Nutzer den Voice-Channel betreten hat
+			var start time.Time
+			err = db.QueryRow(`
+				SELECT start
+				FROM voice_current
+				WHERE id = ?
+			`, id).Scan(&start)
+			if err != nil {
+				log.Fatal("Problem beim Abrufen der Startzeit aktuellen Aufenthalts: ", err)
+			}
+
+			// Berechne die Zeit, die der Nutzer im Voice-Channel verbracht hat
+			duration := now.Sub(start)
+
+			// Trage die Zeit in die Tabelle voice ein
+			_, err = db.Exec(`
+				INSERT INTO voice (user_id, channel_id, duration)
+				VALUES (?, ?, ?)
+			`, userID, channelID, duration.Minutes())
+			if err != nil {
+				log.Fatal("Problem beim Speichern des Voice-Events: ", err)
+			}
+
+			// Lösche den Eintrag aus der Tabelle für die aktuellen Aufenthalte
+			_, err = db.Exec(`
+				DELETE FROM voice_current
+				WHERE id = ?
+			`, id)
+			if err != nil {
+				log.Fatal("Problem beim Löschen des aktuellen Aufenthalts: ", err)
+			}
+		}
+
+		_, err = db.Exec(`
+			INSERT INTO voice_current (channel_id, user_id, start)
+			VALUES (?, ?, ?)
+		`, channelID, userID, now.Format(time.RFC3339))
+		if err != nil {
+			log.Fatal("Problem beim Speichern des aktuellen Aufenthalts: ", err)
+		}
+	} else if voiceEventType == "leave" {
+		// Rufe den Zeitpunkt des letzten join-Events für diesen Nutzer ab
+		var start time.Time
+		err = db.QueryRow(`
+			SELECT start
+			FROM voice_current
+			WHERE user_id = ?
+		`, userID).Scan(&start)
+		if err != nil {
+			log.Fatal("Problem beim Abrufen der Startzeit aktuellen Aufenthalts: ", err)
+		}
+
+		// Berechne die Zeit, die der Nutzer im Voice-Channel verbracht hat
+		duration := now.Sub(start)
+
+		// Da bei einem leave-Event die Channel-ID leer ist, muss diese aus der Tabelle für die aktuellen Aufenthalte abgerufen werden
+		err = db.QueryRow(`
+			SELECT channel_id
+			FROM voice_current
+			WHERE user_id = ?
+		`, userID).Scan(&channelID)
+		if err != nil {
+			log.Fatal("Problem beim Abrufen der Channel-ID des aktuellen Aufenthalts: ", err)
+		}
+
+		// Trage die Zeit in die Tabelle voice ein
+		_, err = db.Exec(`
+			INSERT INTO voice (user_id, channel_id, duration)
+			VALUES (?, ?, ?)
+		`, userID, channelID, duration.Minutes())
+		if err != nil {
+			log.Fatal("Problem beim Speichern des Voice-Events: ", err)
+		}
+
+		// Lösche den Eintrag aus der Tabelle für die aktuellen Aufenthalte
+		_, err = db.Exec(`
+			DELETE FROM voice_current
+			WHERE user_id = ?
+		`, userID)
+		if err != nil {
+			log.Fatal("Problem beim Löschen des aktuellen Aufenthalts: ", err)
+		}
+
+	} else {
+		log.Fatal("Ungültiger Voice-Event-Typ")
 	}
 }
 
@@ -454,6 +610,11 @@ func getUserData(guildID string) string {
 	return fmt.Sprintf(`[%s]`, strings.Join(userData, ","))
 }
 
+func getVoiceData(guildID string) string {
+	//TODO
+	return "{}"
+}
+
 func getChannelName(channelID string) string {
 	channel, err := dgp.Channel(channelID)
 	if err != nil {
@@ -470,61 +631,4 @@ func getUserName(userID string) string {
 		return ""
 	}
 	return user.Username
-}
-
-// Liest die Voice-Events aus der Datenbank aus und gibt die Zeit zurück, die der Nutzer zwischen den letzten beiden leave Events in einem Voice-Channel verbracht hat.
-// Dabei ist es möglich, dass mehrer join Events hintereinander eingetragen sind, das bedeutet, dass der Nutzer in der Zwischenzeit den Channel gewechselt hat. Dann muss die Zeit zusammengezählt werden, beziehungsweise nur der älteste join zählt, seitdem kein leave Event mehr eingetragen wurde.
-func calculateTimeInVoice(guildID, userID string) time.Duration {
-	// Prüfe, ob die Datenbankdatei existiert, erstelle dabei aber KEINE neue Datei
-	dbName := fmt.Sprintf("%s-%d.db", guildID, time.Now().Month())
-	if _, err := os.Stat(dbName); os.IsNotExist(err) {
-		return -1
-	}
-
-	// Öffne die Datenbankverbindung
-	db, err := sql.Open("sqlite3", dbName)
-	if err != nil {
-		log.Fatal("Problem beim Öffnen der Datenbank: ", err)
-	}
-	defer db.Close()
-
-	// Hole die Voice-Events aus der Datenbank
-	rows, err := db.Query(`
-		SELECT type, channel_id, user_id, time
-		FROM voice
-		WHERE user_id = ?
-		ORDER BY time ASC
-	`, userID)
-	if err != nil {
-		log.Fatal("Problem beim Abrufen der Voice-Events: ", err)
-	}
-	defer rows.Close()
-
-	var lastLeaveTime time.Time
-	var totalTime time.Duration
-	for rows.Next() {
-		var voiceEventType, channelID, userID string
-		var timeString string
-		rows.Scan(&voiceEventType, &channelID, &userID, &timeString)
-		t, err := time.Parse(time.RFC3339, timeString)
-		if err != nil {
-			log.Fatal("Problem beim Parsen der Zeit: ", err)
-		}
-		if voiceEventType == "join" {
-			// Wenn der Nutzer den Channel wechselt, dann wird der letzte leave-Eintrag überschrieben
-			lastLeaveTime = t
-		} else {
-			// Wenn der Nutzer den Channel verlässt, dann wird die Zeit zwischen dem letzten leave-Eintrag und dem aktuellen leave-Eintrag addiert
-			totalTime += t.Sub(lastLeaveTime)
-		}
-	}
-
-	// Die totalTime ist eine Duration, die in Nanosekunden angegeben wird. Um die Zeit in Stunden, Minuten und Sekunden zu erhalten, muss diese Duration in einen time.Time umgewandelt werden.
-	// Dazu wird ein time.Time mit dem Unix-Timestamp 0 erstellt und dann die totalTime in Nanosekunden addiert.
-	// Dann kann die totalTime in Stunden, Minuten und Sekunden aufgeteilt werden.
-	// Die totalTime wird in Stunden, Minuten und Sekunden aufgeteilt, weil die totalTime größer als 24 Stunden sein
-
-	// Konvertiere die totalTime in time.Duration
-	return time.Duration(totalTime)
-	//TODO: CODE IN DIESER FUNKTION PRÜFEN, IST KOMPLETT AI-GENERIERT!!!
 }
