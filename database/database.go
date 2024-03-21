@@ -22,10 +22,20 @@ func SetMySqlUrl(dbHost, dbPort, dbUser, dbPass, dbDaba string) {
 }
 
 func openDBConnection() (*sql.DB, error) {
-	if dbUrl == "" {
-		return nil, fmt.Errorf("MySQL URL is not set")
-	}
-	return sql.Open("mysql", dbUrl)
+    if dbUrl == "" {
+        return nil, fmt.Errorf("MySQL URL is not set")
+    }
+    db, err := sql.Open("mysql", dbUrl)
+    if err != nil {
+        return nil, err
+    }
+    // Setze die Zeitzone für die Datenbankverbindung auf Europe/Berlin
+    _, err = db.Exec("SET time_zone = 'Europe/Berlin'")
+    if err != nil {
+        db.Close() // Stelle sicher, dass die Verbindung geschlossen wird, wenn ein Fehler auftritt
+        return nil, err
+    }
+    return db, nil
 }
 
 func Setup(guildID string) error {
@@ -35,11 +45,17 @@ func Setup(guildID string) error {
 	}
 
 	// Open database connection
-	db, err := sql.Open("mysql", dbUrl)
+	db, err := openDBConnection()
 	if err != nil {
-		log.Fatalf("failed to connect to MySQL: %v", err)
+		return fmt.Errorf("failed to connect to MySQL: %v", err)
 	}
 	defer db.Close()
+
+	// Setze die Zeitzone für die Datenbankverbindung auf Europe/Berlin
+	_, err = db.Exec("SET time_zone = 'Europe/Berlin'")
+	if err != nil {
+		panic(err.Error())
+	}
 
 	// Create table for chat messages
 	log.Println("Erstelle Tabelle für Chatnachrichten, falls diese noch nicht existiert")
@@ -97,7 +113,7 @@ func Setup(guildID string) error {
 
 func SaveMessage(guildID, userID, channelID string) error {
 	// Current date and time
-	now := time.Now()
+	now := time.Now().UTC()
 
 	// Open database connection
 	db, err := openDBConnection()
@@ -106,11 +122,17 @@ func SaveMessage(guildID, userID, channelID string) error {
 	}
 	defer db.Close()
 
+	// Setze die Zeitzone für die Datenbankverbindung auf Europe/Berlin
+	_, err = db.Exec("SET time_zone = 'Europe/Berlin'")
+	if err != nil {
+		panic(err.Error())
+	}
+
 	// Insert message into chat table
 	_, err = db.Exec(fmt.Sprintf(`
 		INSERT INTO chat_%s (channel_id, user_id, time)
 		VALUES (?, ?, ?)
-	`, guildID), channelID, userID, now.Format(time.RFC3339))
+	`, guildID), channelID, userID, now.Format("2006-01-02 15:04:05"))
 	if err != nil {
 		return fmt.Errorf("problem saving message: %v", err)
 	}
@@ -119,16 +141,21 @@ func SaveMessage(guildID, userID, channelID string) error {
 
 func SaveVoiceEvent(guildID, userID, channelID string) error {
 	// Current date and time
-	now := time.Now()
+	now := time.Now().UTC()
 	log.Printf("Erfasse aktuelle Zeit. Es ist " + now.String())
 
 	// Open database connection
-	log.Printf("Stelle Verbindung zur Datenbank her")
 	db, err := openDBConnection()
 	if err != nil {
 		return fmt.Errorf("failed to connect to MySQL: %v", err)
 	}
 	defer db.Close()
+
+	// Setze die Zeitzone für die Datenbankverbindung auf Europe/Berlin
+	_, err = db.Exec("SET time_zone = 'Europe/Berlin'")
+	if err != nil {
+		panic(err.Error())
+	}
 
 	log.Printf("Connected to MySQL database for guild: %s\n", guildID)
 
@@ -173,13 +200,13 @@ func SaveVoiceEvent(guildID, userID, channelID string) error {
 		_, err := db.Exec(fmt.Sprintf(`
 			INSERT INTO voice_current_%s (channel_id, user_id, start)
 			VALUES (?, ?, ?)
-		`, guildID), channelID, userID, now.Format(time.RFC3339))
+		`, guildID), channelID, userID, now.Format("2006-01-02 15:04:05"))
 		if err != nil {
 			return fmt.Errorf("problem saving voice event: %v", err)
 		}
 		log.Printf("Voice event saved: User %s joined voice channel %s\n", userID, channelID)
 	case "leave", "move":
-		log.Printf("Da es ein LEAVE- oder MOVE-Event ist wird passend weiter verfahren")
+		log.Println("Da es ein LEAVE- oder MOVE-Event ist wird passend weiter verfahren")
 		var startStr string
 		var start time.Time
 		var duration int
@@ -192,15 +219,24 @@ func SaveVoiceEvent(guildID, userID, channelID string) error {
 		}
 
 		// Refactor the startStr into time obj
+		log.Printf("Die Zeit %s wird für Go formatiert", startStr)
 		start, err = time.Parse("2006-01-02 15:04:05", startStr)
 		if err != nil {
 			return fmt.Errorf("Error parsing start time: %v", err)
 		}
+		log.Printf("Die ausgelesene Startzeit ist: %v", start)
+		log.Printf("Die ausgelesene Startzeit (startStr) ist: %s", startStr)
+		log.Printf("JETZT ist: %v", now)
 
 		// Calculate duration in minutes
 		log.Println("Die Länge des vergangenen Events wird berechnet")
-		duration = int(now.Sub(start).Minutes())
-		log.Printf("Die Länge ist (in Minuten): " + strconv.Itoa(duration))
+		durationRaw := now.Sub(start)
+		log.Printf("durationRaw: %v", durationRaw)
+		durationMin := durationRaw.Minutes()
+		log.Printf("durationMin: %v", durationMin)
+		duration = int(durationMin)
+		log.Printf("duration: %v", duration)
+		log.Println("Die Länge ist (in Minuten): " + strconv.Itoa(duration))
 
 		// Wenn negative Zahl, dann vermutlich weniger als 1 Minute im Call -> Setze auf 1
 		if duration <1 {
